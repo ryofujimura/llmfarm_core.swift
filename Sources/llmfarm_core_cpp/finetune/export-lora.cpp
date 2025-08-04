@@ -1,12 +1,13 @@
 #include "../spm-headers/export-lora.h"
 #include "../ggml/ggml.h"
 #include "../ggml/ggml-alloc.h"
-#include "../ggml/ggml-backend.h"
 #include "../ggml/common.h"
 
 #include <vector>
 #include <string>
 #include <thread>
+
+static const size_t tensor_alignment = 32;
 
 struct lora_info {
     std::string filename;
@@ -191,9 +192,6 @@ static bool export_lora_params_parse(int argc, char ** argv, struct export_lora_
             if (params->n_threads <= 0) {
                 params->n_threads = std::thread::hardware_concurrency();
             }
-        } else if (arg == "-h" || arg == "--help") {
-            export_lora_print_usage(argc, argv, &default_params);
-            exit(0);
         } else {
             fprintf(stderr, "error: unknown argument: '%s'\n", arg.c_str());
             export_lora_print_usage(argc, argv, &default_params);
@@ -247,8 +245,9 @@ static struct lora_data * load_lora(struct lora_info * info) {
     params_ggml.no_alloc   = true;
     result->ctx = ggml_init(params_ggml);
 
+    uint32_t LLAMA_FILE_MAGIC_LORA = 0x67676C61; // 'ggla'
     uint32_t magic   = file.read_u32();
-    if (magic != LLAMA_FILE_MAGIC_GGLA) {
+    if (magic != LLAMA_FILE_MAGIC_LORA) {
         die_fmt("unexpected lora header file magic in '%s'", info->filename.c_str());
     }
     uint32_t version = file.read_u32();
@@ -310,7 +309,7 @@ static struct ggml_cgraph * build_graph_lora(
 ) {
     struct ggml_tensor * ab = ggml_mul_mat(ctx, lora_a, lora_b);
     if (scaling != 1.0f) {
-        ab = ggml_scale(ctx, ab, scaling);
+        ab = ggml_scale(ctx, ab, ggml_new_f32(ctx, scaling));
     }
     struct ggml_tensor * res = ggml_add_inplace(ctx, tensor, ab);
 
@@ -339,14 +338,24 @@ static bool apply_lora(struct ggml_tensor * tensor, struct lora_data * lora, int
     params.mem_buffer = NULL;
     params.no_alloc   = true;
     struct ggml_context * ctx = NULL;
-    struct ggml_gallocr * alloc = NULL;
-    struct ggml_cgraph  * gf = NULL;
+    struct ggml_allocr * alloc = NULL;
+    struct ggml_cgraph * gf = NULL;
 
     ctx   = ggml_init(params);
-    alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    alloc = ggml_allocr_new_measure(tensor_alignment);
     gf    = build_graph_lora(ctx, tensor, lora_a, lora_b, scaling);
+    size_t alloc_size = ggml_allocr_alloc_graph(alloc, gf);
+    ggml_allocr_free(alloc);
+    ggml_free(ctx);
 
-    ggml_gallocr_alloc_graph(alloc, gf);
+    static std::vector<uint8_t> data_compute;
+    data_compute.resize(alloc_size + tensor_alignment);
+
+    ctx   = ggml_init(params);
+    alloc = ggml_allocr_new(data_compute.data(), data_compute.size(), tensor_alignment);
+    gf    = build_graph_lora(ctx, tensor, lora_a, lora_b, scaling);
+    ggml_allocr_alloc_graph(alloc, gf);
+    ggml_allocr_free(alloc);
 
     struct ggml_cplan cplan = ggml_graph_plan(gf, n_threads);
     static std::vector<uint8_t> data_work;
@@ -355,7 +364,6 @@ static bool apply_lora(struct ggml_tensor * tensor, struct lora_data * lora, int
 
     ggml_graph_compute(gf, &cplan);
 
-    ggml_gallocr_free(alloc);
     ggml_free(ctx);
     return true;
 }
